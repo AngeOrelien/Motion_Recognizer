@@ -31,20 +31,19 @@ FACE_MODEL = str(MP_MODELS / "face_landmarker.task")
 # ──────────────────────────────────────────────
 ACTIONS = [
     "bonjour",
-    "merci",
-    "oui",
-    "non",
-    "aide",
-    "comment_ca_va",
-    "au_revoir",
+    "hello comment tu vas?",
+    "je t'aime",
+    "ta mere",
+    "d'accord",
+    "tu as compris",
 ]
 
 # ──────────────────────────────────────────────
 #  PARAMÈTRES DE COLLECTE
 # ──────────────────────────────────────────────
-NB_SEQUENCES    = 40
-SEQUENCE_LENGTH = 30
-COUNTDOWN       = 2
+NB_SEQUENCES    = 20
+SEQUENCE_LENGTH = 40
+COUNTDOWN       = 4
 
 # ──────────────────────────────────────────────
 #  PARAMÈTRES MEDIAPIPE TASKS
