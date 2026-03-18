@@ -1,47 +1,59 @@
 """
-EchoSign Vision - Extracteur de keypoints (mediapipe 0.10.30+ Tasks API)
-=========================================================================
-mediapipe >= 0.10.30 supprime mp.solutions.* et utilise la Tasks API.
-On télécharge les modèles .task au premier lancement (une seule fois).
+EchoSign Vision - Extracteur de keypoints (MediaPipe Tasks API)
+===============================================================
+Compatible mediapipe 0.10.30+.
 
-Interface publique identique : create_holistic, mediapipe_detection,
-draw_landmarks, extract_keypoints, draw_detection_status.
-Vecteur de sortie : 1692 valeurs/frame (pose 132 + face 1434 + mains 126).
+Supporte les DEUX styles utilisés dans le projet :
+
+  Style A (data_collector.py) :
+      detector.detect(frame)
+      draw_landmarks(frame, detector)
+      extract_keypoints(detector)
+
+  Style B (recognizer.py) :
+      image, results = mediapipe_detection(frame, holistic)
+      draw_landmarks(image, results)
+      extract_keypoints(results)
+
+Les deux fonctionnent car EchoSignDetector expose directement
+pose_landmarks / face_landmarks / left/right_hand_landmarks.
 """
 
 import cv2
 import numpy as np
 import urllib.request
-import os
 from pathlib import Path
 
-# ── Téléchargement des modèles .task ─────────────────────────────────────────
-MODELS_DIR = Path(__file__).parent / "mp_models"
-MODELS_DIR.mkdir(exist_ok=True)
+# ── Téléchargement automatique des modèles ────────────────────────────────────
+_MODELS_DIR = Path(__file__).parent / "mp_models"
+_MODELS_DIR.mkdir(exist_ok=True)
 
-_URLS = {
-    "pose":  ("pose_landmarker_lite.task",
-               "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
-               "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"),
-    "face":  ("face_landmarker.task",
-               "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
-               "face_landmarker/float16/latest/face_landmarker.task"),
-    "hands": ("hand_landmarker.task",
-               "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
-               "hand_landmarker/float16/latest/hand_landmarker.task"),
+_MODEL_URLS = {
+    "hand_landmarker.task": (
+        "https://storage.googleapis.com/mediapipe-models/"
+        "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+    ),
+    "pose_landmarker.task": (
+        "https://storage.googleapis.com/mediapipe-models/"
+        "pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+    ),
+    "face_landmarker.task": (
+        "https://storage.googleapis.com/mediapipe-models/"
+        "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+    ),
 }
 
-def _download_models():
-    for key, (fname, url) in _URLS.items():
-        dest = MODELS_DIR / fname
+def _ensure_models():
+    for fname, url in _MODEL_URLS.items():
+        dest = _MODELS_DIR / fname
         if not dest.exists():
-            print(f"  ⬇  Téléchargement {fname} ...")
+            print(f"  Telechargement {fname} ...")
             urllib.request.urlretrieve(url, str(dest))
-            print(f"  ✓  {fname} prêt.")
+            print(f"  OK  {fname} pret.")
 
-_download_models()
+_ensure_models()
 
-# ── Import Tasks API ──────────────────────────────────────────────────────────
+# ── Import MediaPipe Tasks ────────────────────────────────────────────────────
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
@@ -52,88 +64,104 @@ from config import (
     COLOR_GREEN, COLOR_RED, COLOR_WHITE,
 )
 
-# ── Classe _Results (émule l'ancienne interface Holistic) ─────────────────────
+# ── Connexions squelette ──────────────────────────────────────────────────────
+_POSE_CONNECTIONS = [
+    (11,12),(11,13),(13,15),(12,14),(14,16),
+    (11,23),(12,24),(23,24),(23,25),(24,26),(25,27),(26,28)
+]
+_HAND_CONNECTIONS = [
+    (0,1),(1,2),(2,3),(3,4),
+    (0,5),(5,6),(6,7),(7,8),
+    (0,9),(9,10),(10,11),(11,12),
+    (0,13),(13,14),(14,15),(15,16),
+    (0,17),(17,18),(18,19),(19,20),
+    (5,9),(9,13),(13,17)
+]
 
-class _Results:
-    """Conteneur unifié compatible avec le reste du code."""
-    __slots__ = ("pose_landmarks", "face_landmarks",
-                 "left_hand_landmarks", "right_hand_landmarks")
+
+# ── Classe principale ─────────────────────────────────────────────────────────
+
+class EchoSignDetector:
+    """
+    Détecteur combiné Pose + Face + Hands.
+
+    Après detect(frame), les attributs sont mis à jour :
+        .pose_landmarks        -> liste 33 pts  (ou None)
+        .face_landmarks        -> liste 478 pts (ou None)
+        .left_hand_landmarks   -> liste 21 pts  (ou None)
+        .right_hand_landmarks  -> liste 21 pts  (ou None)
+    """
 
     def __init__(self):
+        Base = mp_python.BaseOptions
+
+        self._pose = mp_vision.PoseLandmarker.create_from_options(
+            mp_vision.PoseLandmarkerOptions(
+                base_options=Base(
+                    model_asset_path=str(_MODELS_DIR / "pose_landmarker.task")),
+                running_mode=VisionTaskRunningMode.IMAGE,
+                min_pose_detection_confidence=MP_DETECTION_CONFIDENCE,
+                min_tracking_confidence=MP_TRACKING_CONFIDENCE,
+            )
+        )
+        self._face = mp_vision.FaceLandmarker.create_from_options(
+            mp_vision.FaceLandmarkerOptions(
+                base_options=Base(
+                    model_asset_path=str(_MODELS_DIR / "face_landmarker.task")),
+                running_mode=VisionTaskRunningMode.IMAGE,
+                min_face_detection_confidence=MP_DETECTION_CONFIDENCE,
+                min_tracking_confidence=MP_TRACKING_CONFIDENCE,
+                num_faces=1,
+            )
+        )
+        self._hands = mp_vision.HandLandmarker.create_from_options(
+            mp_vision.HandLandmarkerOptions(
+                base_options=Base(
+                    model_asset_path=str(_MODELS_DIR / "hand_landmarker.task")),
+                running_mode=VisionTaskRunningMode.IMAGE,
+                min_hand_detection_confidence=MP_DETECTION_CONFIDENCE,
+                min_tracking_confidence=MP_TRACKING_CONFIDENCE,
+                num_hands=2,
+            )
+        )
+        # Résultats courants
         self.pose_landmarks       = None
         self.face_landmarks       = None
         self.left_hand_landmarks  = None
         self.right_hand_landmarks = None
 
-
-# ── Détecteur principal ───────────────────────────────────────────────────────
-
-class HolisticDetector:
-    """Combine PoseLandmarker + FaceLandmarker + HandLandmarker (Tasks API)."""
-
-    def __init__(self):
-        BaseOptions = mp_python.BaseOptions
+    def detect(self, frame_bgr):
+        """
+        Lance la détection sur une frame BGR.
+        Met à jour tous les attributs landmarks.
+        Retourne self (chaînable).
+        """
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
         # Pose
-        pose_opts = mp_vision.PoseLandmarkerOptions(
-            base_options=BaseOptions(
-                model_asset_path=str(MODELS_DIR / "pose_landmarker_lite.task")),
-            running_mode=VisionTaskRunningMode.IMAGE,
-            min_pose_detection_confidence=MP_DETECTION_CONFIDENCE,
-            min_tracking_confidence=MP_TRACKING_CONFIDENCE,
-        )
-        self._pose = mp_vision.PoseLandmarker.create_from_options(pose_opts)
+        pose_res = self._pose.detect(mp_img)
+        self.pose_landmarks = (pose_res.pose_landmarks[0]
+                               if pose_res.pose_landmarks else None)
 
-        # Face
-        face_opts = mp_vision.FaceLandmarkerOptions(
-            base_options=BaseOptions(
-                model_asset_path=str(MODELS_DIR / "face_landmarker.task")),
-            running_mode=VisionTaskRunningMode.IMAGE,
-            min_face_detection_confidence=MP_DETECTION_CONFIDENCE,
-            min_tracking_confidence=MP_TRACKING_CONFIDENCE,
-            num_faces=1,
-        )
-        self._face = mp_vision.FaceLandmarker.create_from_options(face_opts)
+        # Visage
+        face_res = self._face.detect(mp_img)
+        self.face_landmarks = (face_res.face_landmarks[0]
+                               if face_res.face_landmarks else None)
 
-        # Hands
-        hand_opts = mp_vision.HandLandmarkerOptions(
-            base_options=BaseOptions(
-                model_asset_path=str(MODELS_DIR / "hand_landmarker.task")),
-            running_mode=VisionTaskRunningMode.IMAGE,
-            min_hand_detection_confidence=MP_DETECTION_CONFIDENCE,
-            min_tracking_confidence=MP_TRACKING_CONFIDENCE,
-            num_hands=2,
-        )
-        self._hands = mp_vision.HandLandmarker.create_from_options(hand_opts)
-
-    def process(self, rgb_frame) -> _Results:
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-        pose_res  = self._pose.detect(mp_image)
-        face_res  = self._face.detect(mp_image)
-        hand_res  = self._hands.detect(mp_image)
-
-        r = _Results()
-
-        # Pose (premier corps détecté)
-        if pose_res.pose_landmarks:
-            r.pose_landmarks = pose_res.pose_landmarks[0]
-
-        # Visage (premier visage détecté)
-        if face_res.face_landmarks:
-            r.face_landmarks = face_res.face_landmarks[0]
-
-        # Mains — handedness : 'Left'/'Right' du point de vue de la personne
-        # Après flip horizontal de la frame, les labels sont déjà corrects.
+        # Mains
+        self.left_hand_landmarks  = None
+        self.right_hand_landmarks = None
+        hand_res = self._hands.detect(mp_img)
         if hand_res.hand_landmarks:
-            for lm_list, handedness_list in zip(hand_res.hand_landmarks,
-                                                hand_res.handedness):
-                label = handedness_list[0].category_name  # 'Left' ou 'Right'
+            for lm_list, handedness in zip(hand_res.hand_landmarks,
+                                           hand_res.handedness):
+                label = handedness[0].category_name   # 'Left' ou 'Right'
                 if label == "Left":
-                    r.left_hand_landmarks  = lm_list
+                    self.left_hand_landmarks  = lm_list
                 else:
-                    r.right_hand_landmarks = lm_list
-
-        return r
+                    self.right_hand_landmarks = lm_list
+        return self
 
     def close(self):
         self._pose.close()
@@ -147,95 +175,96 @@ class HolisticDetector:
         self.close()
 
 
-# ── API publique ──────────────────────────────────────────────────────────────
+# ── Alias compatibilité recognizer.py ────────────────────────────────────────
 
-def create_holistic() -> HolisticDetector:
-    return HolisticDetector()
-
-
-def mediapipe_detection(frame, holistic: HolisticDetector):
-    """Détection sur une frame BGR. Retourne (frame_bgr, results)."""
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = holistic.process(rgb)
-    return frame, results
+def create_holistic() -> EchoSignDetector:
+    """Crée un EchoSignDetector (utilisé par recognizer.py)."""
+    return EchoSignDetector()
 
 
-def extract_keypoints(results: _Results) -> np.ndarray:
-    """Vecteur 1D de 1692 valeurs (pose 132 + face 1434 + mains 126)."""
+def mediapipe_detection(frame_bgr, detector: EchoSignDetector):
+    """
+    Utilisé par recognizer.py.
+    Appelle detect() et retourne (frame, detector).
+    Le detector expose les mêmes attributs qu'un objet results.
+    """
+    detector.detect(frame_bgr)
+    return frame_bgr, detector
+
+
+# ── Extraction des keypoints ──────────────────────────────────────────────────
+
+def extract_keypoints(source) -> np.ndarray:
+    """
+    Accepte un EchoSignDetector (apres detect()) ou tout objet
+    exposant pose/face/left_hand/right_hand_landmarks.
+    Retourne un vecteur 1D de 1692 valeurs.
+    """
     # Pose : 33 × 4 (x, y, z, visibility)
-    if results.pose_landmarks:
+    lms = source.pose_landmarks
+    if lms:
         pose = np.array([[lm.x, lm.y, lm.z,
-                          lm.visibility if hasattr(lm, 'visibility') else 0.0]
-                         for lm in results.pose_landmarks]).flatten()
+                          getattr(lm, 'visibility', 0.0)]
+                         for lm in lms]).flatten()
     else:
         pose = np.zeros(33 * 4)
 
-    # Visage : 478 × 3 (x, y, z)
-    if results.face_landmarks:
-        face = np.array([[lm.x, lm.y, lm.z]
-                         for lm in results.face_landmarks]).flatten()
-        # Padding si moins de 478 points
-        if face.shape[0] < 478 * 3:
-            face = np.concatenate([face, np.zeros(478 * 3 - face.shape[0])])
+    # Visage : 478 × 3
+    lms = source.face_landmarks
+    if lms:
+        raw = np.array([[lm.x, lm.y, lm.z] for lm in lms]).flatten()
+        target = 478 * 3
+        face = np.zeros(target)
+        face[:min(len(raw), target)] = raw[:target]
     else:
         face = np.zeros(478 * 3)
 
-    # Mains : 21 × 3
-    lh = (np.array([[lm.x, lm.y, lm.z]
-                    for lm in results.left_hand_landmarks]).flatten()
-          if results.left_hand_landmarks else np.zeros(21 * 3))
+    # Main gauche : 21 × 3
+    lms = source.left_hand_landmarks
+    lh = (np.array([[lm.x, lm.y, lm.z] for lm in lms]).flatten()
+          if lms else np.zeros(21 * 3))
 
-    rh = (np.array([[lm.x, lm.y, lm.z]
-                    for lm in results.right_hand_landmarks]).flatten()
-          if results.right_hand_landmarks else np.zeros(21 * 3))
+    # Main droite : 21 × 3
+    lms = source.right_hand_landmarks
+    rh = (np.array([[lm.x, lm.y, lm.z] for lm in lms]).flatten()
+          if lms else np.zeros(21 * 3))
 
-    return np.concatenate([pose, face, lh, rh])
+    return np.concatenate([pose, face, lh, rh])   # 132+1434+63+63 = 1692
 
 
-def draw_landmarks(image, results: _Results, draw_face: bool = False):
-    """Dessine les landmarks directement sur l'image (OpenCV)."""
+# ── Dessin ────────────────────────────────────────────────────────────────────
+
+def draw_landmarks(image, source, draw_face: bool = False):
+    """Dessine les landmarks. Accepte un EchoSignDetector ou un objet results."""
     h, w = image.shape[:2]
 
     def pt(lm):
         return int(lm.x * w), int(lm.y * h)
 
-    # Pose — squelette simplifié
-    if results.pose_landmarks:
-        POSE_CONNECTIONS = [
-            (11,12),(11,13),(13,15),(12,14),(14,16),
-            (11,23),(12,24),(23,24),(23,25),(24,26),
-            (25,27),(26,28)
-        ]
-        lms = results.pose_landmarks
-        for a, b in POSE_CONNECTIONS:
+    # Pose
+    lms = source.pose_landmarks
+    if lms:
+        for a, b in _POSE_CONNECTIONS:
             if a < len(lms) and b < len(lms):
                 cv2.line(image, pt(lms[a]), pt(lms[b]), (80, 44, 121), 2)
         for lm in lms:
             cv2.circle(image, pt(lm), 4, (80, 22, 10), -1)
 
     # Mains
-    HAND_CONNECTIONS = [
-        (0,1),(1,2),(2,3),(3,4),
-        (0,5),(5,6),(6,7),(7,8),
-        (0,9),(9,10),(10,11),(11,12),
-        (0,13),(13,14),(14,15),(15,16),
-        (0,17),(17,18),(18,19),(19,20),
-        (5,9),(9,13),(13,17)
-    ]
-    for lms, color_dot, color_line in [
-        (results.left_hand_landmarks,  (121, 22, 76),  (121, 44, 250)),
-        (results.right_hand_landmarks, (245, 117, 66), (245, 66, 230)),
+    for lms, dot_c, line_c in [
+        (source.left_hand_landmarks,  (121, 22, 76),  (121, 44, 250)),
+        (source.right_hand_landmarks, (245, 117, 66), (245, 66, 230)),
     ]:
         if lms:
-            for a, b in HAND_CONNECTIONS:
-                cv2.line(image, pt(lms[a]), pt(lms[b]), color_line, 2)
+            for a, b in _HAND_CONNECTIONS:
+                cv2.line(image, pt(lms[a]), pt(lms[b]), line_c, 2)
             for lm in lms:
-                cv2.circle(image, pt(lm), 4, color_dot, -1)
+                cv2.circle(image, pt(lm), 4, dot_c, -1)
 
     return image
 
 
-def draw_detection_status(image, results: _Results):
+def draw_detection_status(image, source):
     """Indicateurs de détection en haut de l'image."""
     h, w = image.shape[:2]
     overlay = image.copy()
@@ -243,10 +272,10 @@ def draw_detection_status(image, results: _Results):
     cv2.addWeighted(overlay, 0.6, image, 0.4, 0, image)
 
     statuses = [
-        ("POSE",   results.pose_landmarks          is not None, 10),
-        ("VISAGE", results.face_landmarks           is not None, 120),
-        ("MAIN G", results.left_hand_landmarks      is not None, 250),
-        ("MAIN D", results.right_hand_landmarks     is not None, 390),
+        ("POSE",   source.pose_landmarks          is not None, 10),
+        ("VISAGE", source.face_landmarks           is not None, 120),
+        ("MAIN G", source.left_hand_landmarks      is not None, 250),
+        ("MAIN D", source.right_hand_landmarks     is not None, 390),
     ]
     for label, detected, x in statuses:
         color = COLOR_GREEN if detected else COLOR_RED
@@ -256,6 +285,6 @@ def draw_detection_status(image, results: _Results):
     return image
 
 
-def hands_detected(results: _Results) -> bool:
-    return (results.left_hand_landmarks is not None or
-            results.right_hand_landmarks is not None)
+def hands_detected(source) -> bool:
+    return (source.left_hand_landmarks is not None or
+            source.right_hand_landmarks is not None)
